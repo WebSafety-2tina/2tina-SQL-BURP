@@ -4,7 +4,7 @@ from burp import IBurpExtender, ITab, IHttpListener,IScannerCheck, IMessageEdito
 
 from java.io import PrintWriter
 
-from java.awt import GridLayout,FlowLayout,Dimension,Font
+from java.awt import GridLayout,FlowLayout,Dimension,Font,Color
 from java.awt import Component
 from java.awt.event import ActionEvent
 from java.awt.event import ActionListener
@@ -16,6 +16,7 @@ from javax.swing import BoxLayout
 from javax.swing import BorderFactory
 from javax.swing.table import AbstractTableModel
 from javax.swing.table import TableModel
+from javax.swing.table import DefaultTableCellRenderer
 
 from java.net import URLEncoder,URLDecoder
 from java.net import URL
@@ -144,6 +145,27 @@ errorPattern =[
 
 
 class BurpExtender(IBurpExtender, ITab, IHttpListener,IScannerCheck, IMessageEditorController,IContextMenuFactory):
+
+    # 自定义单元格渲染器，用于绿色高亮显示SQL注入漏洞
+    class VulnerableCellRenderer(DefaultTableCellRenderer):
+        def getTableCellRendererComponent(self, table, value, isSelected, hasFocus, row, column):
+            component = super(BurpExtender.VulnerableCellRenderer, self).getTableCellRendererComponent(table, value, isSelected, hasFocus, row, column)
+            
+            # 获取表格模型和对应的LogEntry
+            model = table.getModel()
+            if hasattr(model, 'getVulnerableStatus'):
+                is_vulnerable = model.getVulnerableStatus(row)
+                if is_vulnerable and not isSelected:
+                    # 设置绿色背景（检测到SQL注入漏洞）
+                    component.setBackground(Color(144, 238, 144))  # 浅绿色
+                elif is_vulnerable and isSelected:
+                    # 选中状态下的绿色高亮
+                    component.setBackground(Color(50, 205, 50))    # 深绿色
+                elif not isSelected:
+                    # 默认背景色
+                    component.setBackground(table.getBackground())
+            
+            return component
 
     def processHttpMessage(self,toolFlag, messageIsRequest, messageInfo):
         if messageIsRequest == 0:
@@ -890,15 +912,20 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener,IScannerCheck, IMessageEdi
         change_sign   = ""
         change_sign_1 = ""
         error_sign    = ""
+        is_vulnerable = False  # 新增：标识是否检测到SQL注入漏洞
+        
         #   '   ''  "   ""  -1  -0  ,111    ,1
         if len(resultLenList)%2==0:
             if resultLenList[-2] != original_data_len and resultLenList[-1] == original_data_len:
                 change_sign = unicode("✔ ==> ?","utf-8")
+                is_vulnerable = True  # 长度变化表示可能成功
             elif resultLenList[-2] != resultLenList[-1]:
                 change_sign = unicode("✔ ","utf-8") + str(resultLenList[-2] - resultLenList[-1])
+                is_vulnerable = True  # 长度变化表示可能成功
 
             if diffTime>8000:
                 change_sign+=" time >8"
+                is_vulnerable = True  # 时间延迟表示可能成功
             if change_sign!="":
                 change_sign_1 = unicode(" ✔","utf-8")
 
@@ -908,14 +935,19 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener,IScannerCheck, IMessageEdi
                 pattern = re.compile(each, re.IGNORECASE)
                 if pattern.search(res):
                     error_sign = " Err"
+                    is_vulnerable = True  # 数据库错误表示成功
                     break
+
+        # 创建LogEntry并设置漏洞状态
+        logEntry = self.LogEntry(self.count, requestResponse,
+                helpers.analyzeRequest(requestResponse).getUrl(),
+                key, currentPayload, change_sign+error_sign, str_md5,diffTime, "end",
+                helpers.analyzeResponse(requestResponse.getResponse()).getStatusCode(),resultLenList[-1])
+        logEntry.setVulnerable(is_vulnerable)
 
         if str_md5 not in log2:
             log2[str_md5]=[]
-        log2[str_md5].append(self.LogEntry(self.count, requestResponse,
-                helpers.analyzeRequest(requestResponse).getUrl(),
-                key, currentPayload, change_sign+error_sign, str_md5,diffTime, "end",
-                helpers.analyzeResponse(requestResponse.getResponse()).getStatusCode(),resultLenList[-1]))
+        log2[str_md5].append(logEntry)
         return change_sign_1,error_sign
 
     def getMd5(self,key):
@@ -981,6 +1013,12 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener,IScannerCheck, IMessageEdi
                     return logEntry.response_code
             else:
                 return ""
+
+        def getVulnerableStatus(self, rowIndex):
+            global log3
+            if rowIndex >= 0 and rowIndex < len(log3):
+                return log3[rowIndex].is_vulnerable
+            return False
 
     class FirstModel (AbstractTableModel):
 
@@ -1053,6 +1091,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener,IScannerCheck, IMessageEdi
     class SecondTable(swing.JTable):
         def __init__(self,secondTableModel):
             swing.JTable.__init__(self,secondTableModel)
+            # 应用自定义渲染器到所有列
+            renderer = BurpExtender.VulnerableCellRenderer()
+            for i in range(self.getColumnCount()):
+                self.getColumnModel().getColumn(i).setCellRenderer(renderer)
 
         def changeSelection(self, row, col, toggle, extend):
             global requestViewer,responseViewer,log3,currentlyDisplayedItem
@@ -1081,6 +1123,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener,IScannerCheck, IMessageEdi
             self.times = times
             self.state = state
             self.response_code = response_code
+            self.is_vulnerable = False  # 新增字段：标识是否检测到SQL注入漏洞
 
         def setState(self,state):
             self.state = state
+
+        def setVulnerable(self,is_vulnerable):
+            self.is_vulnerable = is_vulnerable
